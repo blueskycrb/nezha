@@ -1,209 +1,214 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"crypto/tls"
+	"embed"
+	"errors"
+	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"os"
+	"strings"
 	"time"
+	_ "time/tzdata"
 
+	"github.com/gin-gonic/gin"
 	"github.com/ory/graceful"
-	"github.com/patrickmn/go-cache"
-	"github.com/robfig/cron/v3"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
+	"golang.org/x/crypto/bcrypt"
 
-	"github.com/naiba/nezha/cmd/dashboard/controller"
-	"github.com/naiba/nezha/cmd/dashboard/rpc"
-	"github.com/naiba/nezha/model"
-	"github.com/naiba/nezha/service/singleton"
+	"github.com/nezhahq/nezha/cmd/dashboard/controller"
+	"github.com/nezhahq/nezha/cmd/dashboard/controller/waf"
+	"github.com/nezhahq/nezha/cmd/dashboard/rpc"
+	"github.com/nezhahq/nezha/model"
+	"github.com/nezhahq/nezha/pkg/utils"
+	"github.com/nezhahq/nezha/proto"
+	"github.com/nezhahq/nezha/service/singleton"
 )
 
-func init() {
-	shanghai, err := time.LoadLocation("Asia/Shanghai")
-	if err != nil {
-		panic(err)
+type DashboardCliParam struct {
+	Version          bool   // 当前版本号
+	ConfigFile       string // 配置文件路径
+	DatabaseLocation string // Sqlite3 数据库文件路径
+}
+
+var (
+	dashboardCliParam DashboardCliParam
+	//go:embed *-dist
+	frontendDist embed.FS
+)
+
+func initSystem() error {
+	// 初始化管理员账户
+	var usersCount int64
+	if err := singleton.DB.Model(&model.User{}).Count(&usersCount).Error; err != nil {
+		return err
+	}
+	if usersCount == 0 {
+		hash, err := bcrypt.GenerateFromPassword([]byte("admin"), bcrypt.DefaultCost)
+		if err != nil {
+			return err
+		}
+		admin := model.User{
+			Username: "admin",
+			Password: string(hash),
+		}
+		if err := singleton.DB.Create(&admin).Error; err != nil {
+			return err
+		}
+	}
+
+	// 启动 singleton 包下的所有服务
+	singleton.LoadSingleton()
+
+	// 每天的3:30 对 监控记录 和 流量记录 进行清理
+	if _, err := singleton.CronShared.AddFunc("0 30 3 * * *", singleton.CleanServiceHistory); err != nil {
+		return err
+	}
+
+	// 每小时对流量记录进行打点
+	if _, err := singleton.CronShared.AddFunc("0 0 * * * *", singleton.RecordTransferHourlyUsage); err != nil {
+		return err
+	}
+	return nil
+}
+
+// @title           Nezha Monitoring API
+// @version         1.0
+// @description     Nezha Monitoring API
+// @termsOfService  http://nezhahq.github.io
+
+// @contact.name   API Support
+// @contact.url    http://nezhahq.github.io
+// @contact.email  hi@nai.ba
+
+// @license.name  Apache 2.0
+// @license.url   http://www.apache.org/licenses/LICENSE-2.0.html
+
+// @host      localhost:8008
+// @BasePath  /api/v1
+
+// @securityDefinitions.apikey  BearerAuth
+// @in header
+// @name Authorization
+
+// @externalDocs.description  OpenAPI
+// @externalDocs.url          https://swagger.io/resources/open-api/
+func main() {
+	flag.BoolVar(&dashboardCliParam.Version, "v", false, "查看当前版本号")
+	flag.StringVar(&dashboardCliParam.ConfigFile, "c", "data/config.yaml", "配置文件路径")
+	flag.StringVar(&dashboardCliParam.DatabaseLocation, "db", "data/sqlite.db", "Sqlite3数据库文件路径")
+	flag.Parse()
+
+	if dashboardCliParam.Version {
+		fmt.Println(singleton.Version)
+		os.Exit(0)
 	}
 
 	// 初始化 dao 包
-	singleton.Conf = &model.Config{}
-	singleton.Cron = cron.New(cron.WithSeconds(), cron.WithLocation(shanghai))
-	singleton.Crons = make(map[uint64]*model.Cron)
-	singleton.ServerList = make(map[uint64]*model.Server)
-	singleton.SecretToID = make(map[string]uint64)
+	singleton.InitFrontendTemplates()
+	singleton.InitConfigFromPath(dashboardCliParam.ConfigFile)
+	singleton.InitTimezoneAndCache()
+	singleton.InitDBFromPath(dashboardCliParam.DatabaseLocation)
+	if err := initSystem(); err != nil {
+		log.Fatal(err)
+	}
 
-	err = singleton.Conf.Read("data/config.yaml")
+	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", singleton.Conf.ListenHost, singleton.Conf.ListenPort))
 	if err != nil {
-		panic(err)
-	}
-	singleton.DB, err = gorm.Open(sqlite.Open("data/sqlite.db"), &gorm.Config{
-		CreateBatchSize: 200,
-	})
-	if err != nil {
-		panic(err)
-	}
-	if singleton.Conf.Debug {
-		singleton.DB = singleton.DB.Debug()
-	}
-	if singleton.Conf.GRPCPort == 0 {
-		singleton.Conf.GRPCPort = 5555
-	}
-	singleton.Cache = cache.New(5*time.Minute, 10*time.Minute)
-
-	initSystem()
-}
-
-func initSystem() {
-	singleton.DB.AutoMigrate(model.Server{}, model.User{},
-		model.Notification{}, model.AlertRule{}, model.Monitor{},
-		model.MonitorHistory{}, model.Cron{}, model.Transfer{})
-
-	singleton.LoadNotifications()
-	loadServers() //加载服务器列表
-	loadCrons()   //加载计划任务
-
-	// 清理 服务请求记录 和 流量记录 的旧数据
-	_, err := singleton.Cron.AddFunc("0 30 3 * * *", cleanMonitorHistory)
-	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	// 流量记录打点
-	_, err = singleton.Cron.AddFunc("0 0 * * * *", recordTransferHourlyUsage)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func recordTransferHourlyUsage() {
-	singleton.ServerLock.Lock()
-	defer singleton.ServerLock.Unlock()
-	now := time.Now()
-	nowTrimSeconds := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, time.Local)
-	var txs []model.Transfer
-	for id, server := range singleton.ServerList {
-		tx := model.Transfer{
-			ServerID: id,
-			In:       server.State.NetInTransfer - uint64(server.PrevHourlyTransferIn),
-			Out:      server.State.NetOutTransfer - uint64(server.PrevHourlyTransferOut),
-		}
-		if tx.In == 0 && tx.Out == 0 {
-			continue
-		}
-		server.PrevHourlyTransferIn = int64(server.State.NetInTransfer)
-		server.PrevHourlyTransferOut = int64(server.State.NetOutTransfer)
-		tx.CreatedAt = nowTrimSeconds
-		txs = append(txs, tx)
-	}
-	if len(txs) == 0 {
-		return
-	}
-	log.Println("NEZHA>> Cron 流量统计入库", len(txs), singleton.DB.Create(txs).Error)
-}
-
-func cleanMonitorHistory() {
-	// 清理无效数据
-	singleton.DB.Unscoped().Delete(&model.MonitorHistory{}, "created_at < ? OR monitor_id NOT IN (SELECT `id` FROM monitors)", time.Now().AddDate(0, 0, -30))
-	singleton.DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (SELECT `id` FROM servers)")
-	// 计算可清理流量记录的时长
-	var allServerKeep time.Time
-	specialServerKeep := make(map[uint64]time.Time)
-	var specialServerIDs []uint64
-	var alerts []model.AlertRule
-	singleton.DB.Find(&alerts)
-	for i := 0; i < len(alerts); i++ {
-		for j := 0; j < len(alerts[i].Rules); j++ {
-			// 是不是流量记录规则
-			if !alerts[i].Rules[j].IsTransferDurationRule() {
-				continue
-			}
-			dataCouldRemoveBefore := alerts[i].Rules[j].GetTransferDurationStart()
-			// 判断规则影响的机器范围
-			if alerts[i].Rules[j].Cover == model.RuleCoverAll {
-				// 更新全局可以清理的数据点
-				if allServerKeep.IsZero() || allServerKeep.After(dataCouldRemoveBefore) {
-					allServerKeep = dataCouldRemoveBefore
-				}
-			} else {
-				// 更新特定机器可以清理数据点
-				for id := range alerts[i].Rules[j].Ignore {
-					if specialServerKeep[id].IsZero() || specialServerKeep[id].After(dataCouldRemoveBefore) {
-						specialServerKeep[id] = dataCouldRemoveBefore
-						specialServerIDs = append(specialServerIDs, id)
-					}
-				}
-			}
-		}
-	}
-	for id, couldRemove := range specialServerKeep {
-		singleton.DB.Unscoped().Delete(&model.Transfer{}, "server_id = ? AND created_at < ?", id, couldRemove)
-	}
-	if allServerKeep.IsZero() {
-		singleton.DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?)", specialServerIDs)
-	} else {
-		singleton.DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?) AND created_at < ?", specialServerIDs, allServerKeep)
-	}
-}
-
-func loadServers() {
-	var servers []model.Server
-	singleton.DB.Find(&servers)
-	for _, s := range servers {
-		innerS := s
-		innerS.Host = &model.Host{}
-		innerS.State = &model.HostState{}
-		singleton.ServerList[innerS.ID] = &innerS
-		singleton.SecretToID[innerS.Secret] = innerS.ID
-	}
-	singleton.ReSortServer()
-}
-
-func loadCrons() {
-	var crons []model.Cron
-	singleton.DB.Find(&crons)
-	var err error
-	errMsg := new(bytes.Buffer)
-	for i := 0; i < len(crons); i++ {
-		cr := crons[i]
-
-		crIgnoreMap := make(map[uint64]bool)
-		for j := 0; j < len(cr.Servers); j++ {
-			crIgnoreMap[cr.Servers[j]] = true
-		}
-
-		cr.CronJobID, err = singleton.Cron.AddFunc(cr.Scheduler, singleton.CronTrigger(cr))
-		if err == nil {
-			singleton.Crons[cr.ID] = &cr
-		} else {
-			if errMsg.Len() == 0 {
-				errMsg.WriteString("调度失败的计划任务：[")
-			}
-			errMsg.WriteString(fmt.Sprintf("%d,", cr.ID))
-		}
-	}
-	if errMsg.Len() > 0 {
-		msg := errMsg.String()
-		singleton.SendNotification(msg[:len(msg)-1]+"] 这些任务将无法正常执行,请进入后点重新修改保存。", false)
-	}
-	singleton.Cron.Start()
-}
-
-func main() {
-	cleanMonitorHistory()
-	go rpc.ServeRPC(singleton.Conf.GRPCPort)
-	serviceSentinelDispatchBus := make(chan model.Monitor)
+	singleton.CleanServiceHistory()
+	serviceSentinelDispatchBus := make(chan *model.Service) // 用于传递服务监控任务信息的channel
+	rpc.DispatchKeepalive()
 	go rpc.DispatchTask(serviceSentinelDispatchBus)
-	go rpc.DispatchKeepalive()
 	go singleton.AlertSentinelStart()
-	singleton.NewServiceSentinel(serviceSentinelDispatchBus)
-	srv := controller.ServeWeb(singleton.Conf.HTTPPort)
-	graceful.Graceful(func() error {
-		return srv.ListenAndServe()
+	singleton.ServiceSentinelShared, err = singleton.NewServiceSentinel(
+		serviceSentinelDispatchBus, singleton.ServerShared, singleton.NotificationShared, singleton.CronShared)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	grpcHandler := rpc.ServeRPC()
+	httpHandler := controller.ServeWeb(frontendDist)
+	controller.InitUpgrader()
+
+	muxHandler := newHTTPandGRPCMux(httpHandler, grpcHandler)
+	muxServerHTTP := &http.Server{
+		Handler:           muxHandler,
+		ReadHeaderTimeout: time.Second * 5,
+	}
+	muxServerHTTP.Protocols = new(http.Protocols)
+	muxServerHTTP.Protocols.SetHTTP1(true)
+	muxServerHTTP.Protocols.SetUnencryptedHTTP2(true)
+
+	var muxServerHTTPS *http.Server
+	if singleton.Conf.HTTPS.ListenPort != 0 {
+		muxServerHTTPS = &http.Server{
+			Addr:              fmt.Sprintf("%s:%d", singleton.Conf.ListenHost, singleton.Conf.HTTPS.ListenPort),
+			Handler:           muxHandler,
+			ReadHeaderTimeout: time.Second * 5,
+			TLSConfig: &tls.Config{
+				InsecureSkipVerify: singleton.Conf.HTTPS.InsecureTLS,
+			},
+		}
+	}
+
+	errChan := make(chan error, 2)
+	errHTTPS := errors.New("error from https server")
+
+	if err := graceful.Graceful(func() error {
+		log.Printf("NEZHA>> Dashboard::START ON %s:%d", singleton.Conf.ListenHost, singleton.Conf.ListenPort)
+		if singleton.Conf.HTTPS.ListenPort != 0 {
+			go func() {
+				errChan <- muxServerHTTPS.ListenAndServeTLS(singleton.Conf.HTTPS.TLSCertPath, singleton.Conf.HTTPS.TLSKeyPath)
+			}()
+			log.Printf("NEZHA>> Dashboard::START ON %s:%d", singleton.Conf.ListenHost, singleton.Conf.HTTPS.ListenPort)
+		}
+		go func() {
+			errChan <- muxServerHTTP.Serve(l)
+		}()
+		return <-errChan
 	}, func(c context.Context) error {
 		log.Println("NEZHA>> Graceful::START")
-		recordTransferHourlyUsage()
+		singleton.RecordTransferHourlyUsage()
 		log.Println("NEZHA>> Graceful::END")
-		srv.Shutdown(c)
-		return nil
+		var err error
+		if muxServerHTTPS != nil {
+			err = muxServerHTTPS.Shutdown(c)
+		}
+		return errors.Join(muxServerHTTP.Shutdown(c), utils.IfOr(err != nil, utils.NewWrapError(errHTTPS, err), nil))
+	}); err != nil {
+		log.Printf("NEZHA>> ERROR: %v", err)
+		var wrapError *utils.WrapError
+		if errors.As(err, &wrapError) {
+			log.Printf("NEZHA>> ERROR HTTPS: %v", wrapError.Unwrap())
+		}
+	}
+
+	close(errChan)
+}
+
+func newHTTPandGRPCMux(httpHandler http.Handler, grpcHandler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		natConfig := singleton.NATShared.GetNATConfigByDomain(r.Host)
+		if natConfig != nil {
+			if !natConfig.Enabled {
+				c, _ := gin.CreateTestContext(w)
+				waf.ShowBlockPage(c, fmt.Errorf("nat host %s is disabled", natConfig.Domain))
+				return
+			}
+			rpc.ServeNAT(w, r, natConfig)
+			return
+		}
+		if r.ProtoMajor == 2 && r.Header.Get("Content-Type") == "application/grpc" &&
+			strings.HasPrefix(r.URL.Path, "/"+proto.NezhaService_ServiceDesc.ServiceName) {
+			grpcHandler.ServeHTTP(w, r)
+			return
+		}
+		httpHandler.ServeHTTP(w, r)
 	})
 }
